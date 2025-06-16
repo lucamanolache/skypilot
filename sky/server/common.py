@@ -184,7 +184,12 @@ def get_cookies_from_response(
 def get_server_url(host: Optional[str] = None) -> str:
     endpoint = DEFAULT_SERVER_URL
     if host is not None:
-        endpoint = f'http://{host}:46580'
+        # Check if host already has a port number
+        parsed = parse.urlparse(f'http://{host}')
+        if parsed.port is None:
+            endpoint = f'http://{host}:46580'
+        else:
+            endpoint = f'http://{host}'
 
     url = os.environ.get(
         constants.SKY_API_SERVER_URL_ENV_VAR,
@@ -214,8 +219,25 @@ def get_dashboard_url(server_url: str,
 
 
 @annotations.lru_cache(scope='global')
-def is_api_server_local():
-    return get_server_url() in AVAILABLE_LOCAL_API_SERVER_URLS
+def is_api_server_local() -> bool:
+    # We will check if the server is local by checking if the server is
+    # running on the same machine as the client.
+    # We will do this by checking if the server's MAC address is the same as
+    # the client's MAC address.
+    # This requires that the server already is running, if it is not, we will
+    # default to old behavior.
+    try:
+        response = requests.get(f'{get_server_url()}/api/health')
+        result = response.json()
+        if result['mac_address'] is None:
+            raise Exception('Existing API server version is too old.')
+        return result['mac_address'] == common_utils.get_mac_address()
+    except Exception:
+        # TODO(luca): maybe throw error here instead?
+        pass
+    server_url = get_server_url()
+    server_host = parse.urlparse(server_url).hostname
+    return server_host in AVAILBLE_LOCAL_API_SERVER_HOSTS
 
 
 def get_api_server_status(endpoint: Optional[str] = None) -> ApiServerInfo:
@@ -323,7 +345,9 @@ def _start_api_server(deploy: bool = False,
                       foreground: bool = False):
     """Starts a SkyPilot API server locally."""
     server_url = get_server_url(host)
-    assert server_url in AVAILABLE_LOCAL_API_SERVER_URLS, (
+    host = parse.urlparse(server_url).hostname
+    port = parse.urlparse(server_url).port
+    assert host in AVAILBLE_LOCAL_API_SERVER_HOSTS, (
         f'server url {server_url} is not a local url')
     with rich_utils.client_status('Starting SkyPilot API server, '
                                   f'view logs at {constants.API_SERVER_LOGS}'):
@@ -350,6 +374,8 @@ def _start_api_server(deploy: bool = False,
             args += ['--deploy']
         if host is not None:
             args += [f'--host={host}']
+        if port is not None:
+            args += [f'--port={port}']
 
         if foreground:
             # Replaces the current process with the API server
@@ -389,7 +415,7 @@ def _start_api_server(deploy: bool = False,
                         'SkyPilot API server process exited unexpectedly.\n'
                         f'View logs at: {constants.API_SERVER_LOGS}')
             try:
-                check_server_healthy()
+                check_server_healthy(server_url)
             except exceptions.APIVersionMismatchError:
                 raise
             except Exception as e:  # pylint: disable=broad-except
@@ -397,7 +423,7 @@ def _start_api_server(deploy: bool = False,
                     with ux_utils.print_exception_no_traceback():
                         raise RuntimeError(
                             'Failed to start SkyPilot API server at '
-                            f'{get_server_url(host)}'
+                            f'{server_url}'
                             '\nView logs at: '
                             f'{constants.API_SERVER_LOGS}') from e
                 time.sleep(0.5)
@@ -562,7 +588,7 @@ def check_server_healthy_or_start_fn(deploy: bool = False,
                                      foreground: bool = False):
     api_server_status = None
     try:
-        api_server_status = check_server_healthy()
+        api_server_status = check_server_healthy(get_server_url(host))
         if api_server_status == ApiServerStatus.NEEDS_AUTH:
             endpoint = get_server_url()
             with ux_utils.print_exception_no_traceback():

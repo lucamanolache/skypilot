@@ -1240,6 +1240,7 @@ async def health(request: fastapi.Request) -> Dict[str, Any]:
         'version_on_disk': common.get_skypilot_version_on_disk(),
         'commit': sky.__commit__,
         'user': user.to_dict() if user is not None else None,
+        'mac_address': common_utils.get_mac_address(),
     }
 
 

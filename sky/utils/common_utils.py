@@ -53,6 +53,11 @@ _VALID_ENV_VAR_REGEX = '[a-zA-Z_][a-zA-Z0-9_]*'
 logger = sky_logging.init_logger(__name__)
 
 
+def get_mac_address() -> str:
+    """Returns the MAC address of the machine."""
+    return ':'.join(re.findall('..', '%012x' % uuid.getnode()))
+
+
 @annotations.lru_cache(scope='request')
 def get_usage_run_id() -> str:
     """Returns a unique run id for each 'run'.
