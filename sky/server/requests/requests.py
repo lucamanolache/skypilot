@@ -99,6 +99,7 @@ REQUEST_COLUMNS = [
     COL_STATUS_MSG,
     COL_SHOULD_RETRY,
     COL_FINISHED_AT,
+    'managed_job_id',
 ]
 
 
@@ -133,6 +134,7 @@ class Request:
     should_retry: bool = False
     # When the request finished.
     finished_at: Optional[float] = None
+    managed_job_id: Optional[int] = None
 
     @property
     def log_path(self) -> pathlib.Path:
@@ -220,6 +222,7 @@ class Request:
             status_msg=self.status_msg,
             should_retry=self.should_retry,
             finished_at=self.finished_at,
+            managed_job_id=self.managed_job_id,
         )
 
     def encode(self) -> payloads.RequestPayload:
@@ -243,6 +246,7 @@ class Request:
                 status_msg=self.status_msg,
                 should_retry=self.should_retry,
                 finished_at=self.finished_at,
+                managed_job_id=self.managed_job_id,
             )
         except (TypeError, ValueError) as e:
             # The error is unexpected, so we don't suppress the stack trace.
@@ -276,6 +280,7 @@ class Request:
                 status_msg=payload.status_msg,
                 should_retry=payload.should_retry,
                 finished_at=payload.finished_at,
+                managed_job_id=payload.managed_job_id,
             )
         except (TypeError, ValueError) as e:
             logger.error(
@@ -288,6 +293,48 @@ class Request:
                 exc_info=e)
             # The error is unexpected, so we don't suppress the stack trace.
             raise
+
+
+def get_jobs_queue_requests() -> List[Dict[str, Any]]:
+    """Get the requests for the jobs queue."""
+    # pylint: disable=import-outside-toplevel
+    from sky.jobs import utils as managed_job_utils
+
+    return managed_job_utils.get_jobs_queue_requests([
+        request_task for request_task in get_request_tasks(
+            status=[RequestStatus.PENDING, RequestStatus.RUNNING],
+            all_managed_jobs=True)
+    ])
+
+
+def kill_managed_job_requests(
+    managed_job_ids: Optional[List[int]] = None,
+    all_users: bool = False,
+    name: Optional[str] = None,
+):
+    """Kill all pending requests for a managed job."""
+    all_managed_jobs = managed_job_ids is None
+    user_id = common_utils.get_user_hash() if all_users else None
+
+    if name is None:
+        request_ids = [
+            (request_task.request_id, request_task.managed_job_id)
+            for request_task in get_request_tasks(
+                managed_job_ids=managed_job_ids,
+                all_managed_jobs=all_managed_jobs,
+                user_id=user_id,
+                status=[RequestStatus.PENDING, RequestStatus.RUNNING])
+        ]
+    else:
+        request_ids = [
+            (request_task.request_id, request_task.managed_job_id)
+            for request_task in get_request_tasks(
+                status=[RequestStatus.PENDING, RequestStatus.RUNNING])
+            if request_task.cluster_name == name
+        ]
+
+    kill_requests([e[0] for e in request_ids])
+    return [e[1] for e in request_ids]
 
 
 def kill_cluster_requests(cluster_name: str, exclude_request_name: str):
@@ -493,6 +540,7 @@ def create_table(cursor, conn):
         {COL_STATUS_MSG} TEXT,
         {COL_SHOULD_RETRY} INTEGER,
         {COL_FINISHED_AT} REAL
+        managed_job_id INTEGER
         )""")
 
     db_utils.add_column_to_table(cursor, conn, REQUEST_TABLE, COL_STATUS_MSG,
@@ -501,6 +549,8 @@ def create_table(cursor, conn):
                                  'INTEGER')
     db_utils.add_column_to_table(cursor, conn, REQUEST_TABLE, COL_FINISHED_AT,
                                  'REAL')
+    db_utils.add_column_to_table(cursor, conn, REQUEST_TABLE, 'managed_job_id',
+                                 'INTEGER')
 
 
 _DB = None
@@ -604,6 +654,8 @@ def get_request_tasks(
     exclude_request_names: Optional[List[str]] = None,
     include_request_names: Optional[List[str]] = None,
     finished_before: Optional[float] = None,
+    managed_job_ids: Optional[List[int]] = None,
+    all_managed_jobs: bool = False,
 ) -> List[Request]:
     """Get a list of requests that match the given filters.
 
@@ -650,6 +702,12 @@ def get_request_tasks(
     if finished_before is not None:
         filters.append('finished_at < ?')
         filter_params.append(finished_before)
+    if managed_job_ids is not None:
+        managed_job_ids_str = ','.join(repr(id) for id in managed_job_ids)
+        # TODO: fix this so there can be no SQL injection
+        filters.append(f'managed_job_id IN ({managed_job_ids_str})')
+    if all_managed_jobs:
+        filters.append('managed_job_id IS NOT NULL')
     assert _DB is not None
     with _DB.conn:
         cursor = _DB.conn.cursor()

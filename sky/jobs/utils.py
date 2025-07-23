@@ -633,23 +633,28 @@ def cancel_jobs_by_id(job_ids: Optional[List[int]],
             None, all_users)
     job_ids = list(set(job_ids))
     if not job_ids:
-        return 'No job to cancel.'
+        # Return 5 empty lists for consistency
+        result: List[List[Any]] = [[], [], [], [], []]
+        return str(result)
     if current_workspace is None:
         current_workspace = constants.SKYPILOT_DEFAULT_WORKSPACE
 
     cancelled_job_ids: List[int] = []
-    wrong_workspace_job_ids: List[int] = []
+    wrong_workspace_job_ids: List[object] = []
+    not_found_job_ids: List[object] = []
+    terminal_job_ids: List[object] = []
+    failed_cancel_job_ids: List[object] = []
     started = False
     for job_id in job_ids:
         # Check the status of the managed job status. If it is in
         # terminal state, we can safely skip it.
         job_status = managed_job_state.get_status(job_id)
         if job_status is None:
-            logger.info(f'Job {job_id} not found. Skipped.')
+            not_found_job_ids.append((job_id, 'not found'))
             continue
         elif job_status.is_terminal():
-            logger.info(f'Job {job_id} is already in terminal state '
-                        f'{job_status.value}. Skipped.')
+            terminal_job_ids.append(
+                (job_id, f'already in terminal state: {job_status.value}'))
             continue
         elif job_status == managed_job_state.ManagedJobStatus.PENDING:
             # the if is a short circuit, this will be atomic.
@@ -677,49 +682,47 @@ def cancel_jobs_by_id(job_ids: Optional[List[int]],
                                            f'{job_id}')
                 signal_file.touch()
                 cancelled_job_ids.append(job_id)
-            except OSError as e:
-                logger.error(f'Failed to cancel job {job_id} '
-                             f'with controller server: {e}')
-                # don't add it to the to be cancelled job ids, since we don't
-                # know for sure yet.
+            except OSError:
+                failed_cancel_job_ids.append(
+                    (job_id, 'OSError during controller server signal'))
                 continue
             continue
 
         job_workspace = managed_job_state.get_workspace(job_id)
         if current_workspace is not None and job_workspace != current_workspace:
-            wrong_workspace_job_ids.append(job_id)
+            wrong_workspace_job_ids.append(
+                (job_id, f'wrong workspace: {job_workspace!r}'))
             continue
 
         # Send the signal to the jobs controller.
         signal_file = pathlib.Path(SIGNAL_FILE_PREFIX.format(job_id))
         # Filelock is needed to prevent race condition between signal
         # check/removal and signal writing.
-        with filelock.FileLock(str(signal_file) + '.lock'):
-            with signal_file.open('w', encoding='utf-8') as f:
-                f.write(UserSignal.CANCEL.value)
-                f.flush()
-        cancelled_job_ids.append(job_id)
+        try:
+            with filelock.FileLock(str(signal_file) + '.lock'):
+                with signal_file.open('w', encoding='utf-8') as f:
+                    f.write(UserSignal.CANCEL.value)
+                    f.flush()
+            cancelled_job_ids.append(job_id)
+        except OSError:
+            failed_cancel_job_ids.append((job_id, 'OSError during file signal'))
 
-    wrong_workspace_job_str = ''
-    if wrong_workspace_job_ids:
-        plural = 's' if len(wrong_workspace_job_ids) > 1 else ''
-        plural_verb = 'are' if len(wrong_workspace_job_ids) > 1 else 'is'
-        wrong_workspace_job_str = (
-            f' Job{plural} with ID{plural}'
-            f' {", ".join(map(str, wrong_workspace_job_ids))} '
-            f'{plural_verb} skipped as they are not in the active workspace '
-            f'{current_workspace!r}. Check the workspace of the job with: '
-            f'sky jobs queue')
-
-    if not cancelled_job_ids:
-        return f'No job to cancel.{wrong_workspace_job_str}'
-    identity_str = f'Job with ID {cancelled_job_ids[0]} is'
-    if len(cancelled_job_ids) > 1:
-        cancelled_job_ids_str = ', '.join(map(str, cancelled_job_ids))
-        identity_str = f'Jobs with IDs {cancelled_job_ids_str} are'
-
-    msg = f'{identity_str} scheduled to be cancelled.{wrong_workspace_job_str}'
-    return msg
+    # Always return a stringified Python list of lists for easy parsing
+    # [
+    #   [not_found_job_ids],
+    #   [terminal_job_ids],
+    #   [wrong_workspace_job_ids],
+    #   [cancelled_job_ids],
+    #   [failed_cancel_job_ids]
+    # ]
+    result = [
+        not_found_job_ids,
+        terminal_job_ids,
+        wrong_workspace_job_ids,
+        cancelled_job_ids,
+        failed_cancel_job_ids,
+    ]
+    return str(result)
 
 
 def cancel_job_by_name(job_name: str,
@@ -1216,6 +1219,42 @@ def load_managed_job_queue(payload: str) -> List[Dict[str, Any]]:
             # TODO(cooperc): Remove check before 0.12.0.
             user = global_user_state.get_user(job['user_hash'])
             job['user_name'] = user.name if user is not None else None
+    return jobs
+
+
+def get_jobs_queue_requests(job_ids: List[Any]) -> list:
+    """Constructs job dicts for a list of managed job IDs, setting status
+    to 'PENDING'."""
+    jobs = []
+    for request in job_ids:
+        # We only have job_id, so fill what we can
+        job = {
+            'job_id': request.managed_job_id,
+            'task_name': '-',
+            'job_name': '-',
+            'user_hash': request.user_id,
+            'task_id': 0,
+            'resources': '-',
+            'user_name': '-',
+            'workspace':
+                skypilot_config.get_active_workspace(force_user_workspace=True),
+            'submitted_at': None,
+            'start_at': None,
+            'end_at': None,
+            'job_duration': 0,
+            'status': 'PENDING',
+            'schedule_state': 'INACTIVE',
+            'cluster_resources': '-',
+            'cluster_resources_full': '-',
+            'cloud': '-',
+            'region': '-',
+            'zone': '-',
+            'details': None,
+            'failure_reason': None,
+            'priority': None,
+            'recovery_count': 0,
+        }
+        jobs.append(job)
     return jobs
 
 

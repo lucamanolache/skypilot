@@ -1,7 +1,9 @@
 """SDK functions for managed jobs."""
+import ast
 import os
 import pathlib
 import tempfile
+import time
 import typing
 from typing import Any, Dict, List, Optional, Tuple, Union
 import uuid
@@ -24,6 +26,7 @@ from sky.jobs import constants as managed_job_constants
 from sky.jobs import state as managed_job_state
 from sky.jobs import utils as managed_job_utils
 from sky.provision import common as provision_common
+from sky.server.requests import requests
 from sky.skylet import constants as skylet_constants
 from sky.usage import usage_lib
 from sky.utils import admin_policy_utils
@@ -31,6 +34,7 @@ from sky.utils import common
 from sky.utils import common_utils
 from sky.utils import controller_utils
 from sky.utils import dag_utils
+from sky.utils import message_utils
 from sky.utils import rich_utils
 from sky.utils import status_lib
 from sky.utils import subprocess_utils
@@ -87,7 +91,9 @@ def _upload_files_to_controller(dag: 'sky.Dag') -> Dict[str, str]:
     return local_to_controller_file_mounts
 
 
-def _maybe_submit_job_locally(prefix: str, dag: 'sky.Dag') -> Optional[int]:
+def _maybe_submit_job_locally(prefix: str,
+                              dag: 'sky.Dag',
+                              job_id: Optional[int] = None) -> Optional[int]:
     """Submit the managed job locally if in consolidation mode.
 
     In normal mode the managed job submission is done in the ray job submission.
@@ -100,19 +106,21 @@ def _maybe_submit_job_locally(prefix: str, dag: 'sky.Dag') -> Optional[int]:
         return None
 
     # Create local directory for the managed job.
+    # we should have one if we were in consolidation mode
+    assert job_id is not None
     pathlib.Path(prefix).expanduser().mkdir(parents=True, exist_ok=True)
-    consolidation_mode_job_id = managed_job_state.set_job_info_without_job_id(
-        dag.name,
+    managed_job_state.set_job_info(
+        job_id=job_id,
+        name=dag.name,
         workspace=skypilot_config.get_active_workspace(
             force_user_workspace=True),
         entrypoint=common_utils.get_current_command())
     for task_id, task in enumerate(dag.tasks):
         resources_str = backend_utils.get_task_resources_str(
             task, is_managed_job=True)
-        managed_job_state.set_pending(consolidation_mode_job_id, task_id,
-                                      task.name, resources_str,
+        managed_job_state.set_pending(job_id, task_id, task.name, resources_str,
                                       task.metadata_json)
-    return consolidation_mode_job_id
+    return job_id
 
 
 @timeline.event
@@ -121,6 +129,7 @@ def launch(
     task: Union['sky.Task', 'sky.Dag'],
     name: Optional[str] = None,
     stream_logs: bool = True,
+    job_id: Optional[int] = None,
 ) -> Tuple[Optional[int], Optional[backends.ResourceHandle]]:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Launches a managed job.
@@ -281,7 +290,9 @@ def launch(
             controller=controller,
             task_resources=sum([list(t.resources) for t in dag.tasks], []))
 
-        consolidation_mode_job_id = _maybe_submit_job_locally(prefix, dag)
+        time.sleep(300)
+        consolidation_mode_job_id = _maybe_submit_job_locally(
+            prefix, dag, job_id)
 
         # This is only needed for non-consolidation mode. For consolidation
         # mode, the controller uses the same catalog as API server.
@@ -348,6 +359,7 @@ def launch(
                                             stream_logs=stream_logs,
                                             retry_until_up=True,
                                             fast=True,
+                                            _managed_job_id=job_id,
                                             _disable_controller_check=True)
                 # Manually launch the scheduler process in consolidation mode.
                 local_handle = backend_utils.is_controller_accessible(
@@ -546,6 +558,16 @@ def queue(refresh: bool,
         raise RuntimeError('Failed to fetch managed jobs with returncode: '
                            f'{returncode}.\n{job_table_payload + stderr}')
 
+    queue_requests = requests.get_jobs_queue_requests()
+    try:
+        queue_requests.sort(key=lambda job: int(job['job_id']))
+    except ValueError:
+        pass
+
+    job_table_payload = message_utils.decode_payload(job_table_payload)
+    queue_requests.extend(job_table_payload)
+    job_table_payload = message_utils.encode_payload(queue_requests)
+
     jobs = managed_job_utils.load_managed_job_queue(job_table_payload)
 
     if not all_users:
@@ -621,11 +643,14 @@ def cancel(name: Optional[str] = None,
         if all_users:
             code = managed_job_utils.ManagedJobCodeGen.cancel_jobs_by_id(
                 None, all_users=True)
+            killed = requests.kill_managed_job_requests(job_ids, all_users=True)
         elif all:
             code = managed_job_utils.ManagedJobCodeGen.cancel_jobs_by_id(None)
+            killed = requests.kill_managed_job_requests(None)
         elif job_ids:
             code = managed_job_utils.ManagedJobCodeGen.cancel_jobs_by_id(
                 job_ids)
+            killed = requests.kill_managed_job_requests(job_ids)
         else:
             assert name is not None, (job_ids, name, all)
             code = managed_job_utils.ManagedJobCodeGen.cancel_job_by_name(name)
@@ -639,10 +664,64 @@ def cancel(name: Optional[str] = None,
                                                'Failed to cancel managed job',
                                                stdout + stderr)
         except exceptions.CommandError as e:
+            if killed:
+                logger.info(f'Cancelled {len(killed)} managed jobs')
+
             with ux_utils.print_exception_no_traceback():
                 raise RuntimeError(e.error_msg) from e
 
-        logger.info(stdout)
+        # Parse the output from cancel_jobs_by_id
+        try:
+            parsed = ast.literal_eval(stdout.strip())
+            not_found, terminal, wrong_workspace, cancelled, failed = parsed
+            # Integrate killed jobs: add to cancelled, remove from not_found
+            if killed:
+                for job_id in killed:
+                    if job_id not in cancelled:
+                        cancelled.append(job_id)
+                    # Remove from not_found if present
+                    not_found = [x for x in not_found if x[0] != job_id]
+            msg_lines = []
+            # Not found jobs (one line per job)
+            for x in not_found:
+                msg_lines.append(f'Job with ID {x[0]} not found.')
+            # Wrong workspace jobs
+            if terminal:
+                ids = ', '.join(str(x[0]) for x in terminal)
+                msg_lines.append(
+                    f'Job with ID {ids} are already in terminal state.')
+            if wrong_workspace:
+                ids = ', '.join(str(x[0]) for x in wrong_workspace)
+                workspace_name = wrong_workspace[0][1].split(':', 1)[-1].strip(
+                ).strip('\'') if ':' in wrong_workspace[0][1] else 'unknown'
+                msg_lines.append(
+                    f'Job with ID {ids} are skipped as they are not in the '
+                    f'active workspace {workspace_name}. Check the workspace '
+                    'of the job with: sky jobs queue')
+            # Scheduled to be cancelled
+            if cancelled:
+                if len(cancelled) == 1:
+                    msg_lines.append(
+                        f'Job with ID {cancelled[0]} is scheduled to be '
+                        'cancelled.')
+                elif len(cancelled) > 1:
+                    ids = ', '.join(str(x) for x in cancelled)
+                    msg_lines.append(
+                        f'Job with ID {ids} are scheduled to be cancelled.')
+            # Failed cancels
+            if failed:
+                ids = ', '.join(str(x[0]) for x in failed)
+                msg_lines.append(f'Job with ID {ids} failed to be cancelled.')
+            # If nothing to cancel
+            if not (not_found or wrong_workspace or cancelled or failed):
+                msg_lines = ['No job to cancel.']
+            combined_msg = '\n'.join(msg_lines)
+        except Exception:  # pylint: disable=broad-except
+            combined_msg = stdout.strip()
+            combined_msg += ('\n' + 'Unexpected formatting error (most likely '
+                             'outdated jobs controller).\n'
+                             f'Also cancelled jobs: {", ".join(killed)}.')
+        logger.info(combined_msg)
         if 'Multiple jobs found with name' in stdout:
             with ux_utils.print_exception_no_traceback():
                 raise RuntimeError(
